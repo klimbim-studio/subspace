@@ -1,0 +1,12 @@
+{
+  "name": "@klimbim/subspace",
+  "version": "0.0.0",
+  "license": "MIT",
+  "type": "module",
+  "files": ["README.md", "LICENSE"],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/klimbim-studio/subspace.git"
+  },
+  "publishConfig": { "access": "public" }
+}

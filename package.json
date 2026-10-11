@@ -1,0 +1,28 @@
+{
+  "name": "agentenpost",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun test --timeout 30000",
+    "typecheck": "tsc --noEmit",
+    "e2e:konten": "bun tests/konten.e2e.ts",
+    "npm:paket": "bun src/paket/bauen.ts --npm"
+  },
+  "bin": {
+    "subspace": "src/cli/agentenpost.ts",
+    "cartridge": "src/cli/agentenpost.ts"
+  },
+  "dependencies": {
+    "@noble/ciphers": "2.4.0",
+    "@noble/curves": "2.4.0",
+    "@noble/hashes": "2.4.0",
+    "@simplewebauthn/browser": "14.0.0",
+    "@simplewebauthn/server": "14.0.3"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "playwright": "1.63.0",
+    "typescript": "7.0.2"
+  }
+}
