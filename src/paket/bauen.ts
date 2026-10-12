@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { copyFile, mkdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
 const wurzel = resolve(import.meta.dir, "../..");
 const paketOrdner = join(wurzel, "out/paket/cartridge-paket");
@@ -24,6 +24,26 @@ if (argumente.includes("--npm")) {
     process.exit(1);
   }
   const out = outValue ? resolve(wurzel, outValue) : join(wurzel, "out/npm");
+  let existing = out;
+  let canonicalOut: string;
+  while (true) {
+    try {
+      canonicalOut = resolve(await realpath(existing), relative(existing, out));
+      break;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== "ENOENT" && code !== "ENOTDIR") throw error;
+      const parent = dirname(existing);
+      if (parent === existing) throw error;
+      existing = parent;
+    }
+  }
+  const canonicalRoot = await realpath(wurzel);
+  const pathFromOutToRoot = relative(canonicalOut, canonicalRoot);
+  if (pathFromOutToRoot === "" || (!isAbsolute(pathFromOutToRoot) && pathFromOutToRoot !== ".." && !pathFromOutToRoot.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`))) {
+    console.error("--out must not be the repository root or one of its parent directories.");
+    process.exit(2);
+  }
   await rm(out, { recursive: true, force: true });
   await mkdir(out, { recursive: true });
   const build = Bun.spawnSync([
@@ -39,10 +59,11 @@ if (argumente.includes("--npm")) {
   let license = "UNLICENSED";
   try {
     const spdxLicense = (await readFile(join(wurzel, "paket/LICENSE-SPDX"), "utf8")).split(/\r?\n/u)[0]!.trim();
+    if (!spdxLicense) throw new Error("paket/LICENSE-SPDX is empty.");
     await copyFile(join(wurzel, "paket/LICENSE"), join(out, "LICENSE"));
     license = spdxLicense;
   } catch {
-    console.error("Warning: paket/LICENSE is missing; package will be marked UNLICENSED.");
+    console.error("Warning: package license is missing or empty; package will be marked UNLICENSED.");
   }
   const files = ["package.json", "subspace.js", "README.md", "SKILL.md", ...(license === "UNLICENSED" ? [] : ["LICENSE"])];
   await writeFile(join(out, "package.json"), `${JSON.stringify({

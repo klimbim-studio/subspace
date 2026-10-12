@@ -23,6 +23,7 @@ import { setup as createSetup, trust as trustContact } from "./setup.ts";
 import { annehmen, pruefeEmpfaengerSchluessel, tauscheSchluessel, widersprecheSchluessel, widerrufeSchluessel } from "./buergschaft.ts";
 import { bearbeiteEinladungsauftraege, fuehreBeitrittAus } from "./beitritt.ts";
 import { fuehreKontoAus } from "./konto.ts";
+import { connect as connectAgent } from "./verbinden.ts";
 
 interface Optionen {
   positionen: string[];
@@ -37,7 +38,7 @@ function optionenLesen(args: string[]): Optionen {
     open: "oeffnen", contacts: "kontakte",
     account: "konto", help: "hilfe",
   };
-  const germanischeBefehle = new Set(["annehmen", "oeffentlich", "senden", "einladen", "einladungen", "oeffnen", "kontakte", "konto", "hilfe", "schluessel"]);
+  const germanischeBefehle = new Set(["annehmen", "oeffentlich", "senden", "einladen", "einladungen", "oeffnen", "kontakte", "konto", "verbinden", "hilfe", "schluessel"]);
   const germanischeOptionen = new Set(["konfig", "schluessel", "ordner", "postamt", "laufzeit", "an", "kanal", "art", "betreff", "text-datei", "bezug", "anhang", "ausgeloest-von", "fuer", "skript", "warten", "fortsetzen", "signatur", "fingerabdruck", "ausgabe"]);
   let firstCommand = 0;
   while (firstCommand < args.length && args[firstCommand]!.startsWith("--")) {
@@ -386,13 +387,14 @@ const befehlsHilfen: Record<string, BefehlsHilfe> = {
   senden: { verwendung: "send --config <path> --key <path> --kind <info|request> --subject <text> --text-file <path> (--to <names> | --channel <name>) [--lifetime <days>] [--ref <id>] [--triggered-by <name>:<envelope_id>] [--attach <path>]", beschreibung: "Send an encrypted message to agents or a channel.", optionen: [["--config <path>", "Configuration file path."], ["--key <path>", "Key file path."], ["--kind <info|request>", "Message kind: info or request."], ["--subject <text>", "Message subject."], ["--text-file <path>", "File containing the message text."], ["--to <names>", "Comma-separated recipient names."], ["--lifetime <days>", "Validity in days (1 to 30; default: 7)."], ["--channel <name>", "Configured recipient channel."], ["--ref <id>", "ID of the message being answered."], ["--triggered-by <name>:<envelope_id>", "Message that triggered this message."], ["--attach <path>", "Attachment file; can be repeated."]] },
   fetch: { verwendung: "fetch --config <path> --key <path>", beschreibung: "Fetch messages and store them in the quarantine folder.", optionen: [["--config <path>", "Configuration file path."], ["--key <path>", "Key file path."]] },
   status: { verwendung: "status <id> --config <path> --key <path>", beschreibung: "Show the delivery status of a message.", optionen: [["--config <path>", "Configuration file path."], ["--key <path>", "Key file path."]] },
-  einladen: { verwendung: "invite --for <name> --config <path> --key <path> [--script <path>]", beschreibung: "Create an invitation for a code comparison.", optionen: [["--for <name>", "Name of the joining agent."], ["--config <path>", "Configuration file path."], ["--key <path>", "Key file path."], ["--script <path>", "Script file for its SHA-256 fingerprint."]] },
+  einladen: { verwendung: "invite --for <name> --config <path> --key <path> [--script <path>]", beschreibung: "Create a browser address and an agent line for an invitation.", optionen: [["--for <name>", "Name of the joining agent."], ["--config <path>", "Configuration file path."], ["--key <path>", "Key file path."], ["--script <path>", "Script file for its SHA-256 fingerprint."]] },
   einladungen: { verwendung: "invites --config <path> --key <path>", beschreibung: "Show your invitations and post office notices.", optionen: [["--config <path>", "Configuration file path."], ["--key <path>", "Key file path."]] },
-  oeffnen: { verwendung: "open <name> --config <path> --key <path>", beschreibung: "Verify a redemption and open an invitation once.", optionen: [["--config <path>", "Configuration file path."], ["--key <path>", "Key file path."]] },
-  join: { verwendung: "join (--link - | --resume [--token <prefix>]) (--dir <path> | --config <path> --key <path>) [--wait <seconds>]", beschreibung: "Redeem an invitation link or resume a join.", optionen: [["--link -", "Read the invitation link from standard input."], ["--dir <path>", "Create a new configuration and key in this directory."], ["--config <path>", "Existing configuration."], ["--key <path>", "Existing key."], ["--resume", "Wait for confirmation and complete the join."], ["--token <prefix>", "Select a pending join by the first 8 token characters."], ["--wait <seconds>", "Maximum wait time (default: 600)."]] },
-  confirm: { verwendung: "confirm <name> --config <path> --key <path> [--token <prefix>]", beschreibung: "Compare the spoken code and confirm the join.", optionen: [["--config <path>", "Configuration file path."], ["--key <path>", "Key file path."], ["--token <prefix>", "Select an open invitation by the first 8 token characters."]] },
-  kontakte: { verwendung: "contacts --config <path> [--key <path>]", beschreibung: "Show confirmed contacts and open code comparisons.", optionen: [["--config <path>", "Configuration file path."], ["--key <path>", "Verify current contact signing keys."]] },
+  oeffnen: { verwendung: "open <name> --config <path> --key <path>", beschreibung: "Deprecated. Use confirm.", optionen: [["--config <path>", "Configuration file path."], ["--key <path>", "Key file path."]] },
+  join: { verwendung: "join <agent-line> | join - [--resume] [--token <prefix>] (--dir <path> | --config <path> --key <path>) [--wait <seconds>]", beschreibung: "Redeem an invitation agent line and wait for confirmation.", optionen: [["<agent-line>", "Invitation details for your agent; do not paste into a browser."], ["-", "Read the agent line from standard input."], ["--dir <path>", "Create a new configuration and key in this directory."], ["--config <path>", "Existing configuration."], ["--key <path>", "Existing key."], ["--resume", "Resume a pending join."], ["--token <prefix>", "Select a pending join by the first 8 token characters."], ["--wait <seconds>", "Maximum wait time (default: 600)."]] },
+  confirm: { verwendung: "confirm <name> --config <path> --key <path> [--token <prefix>]", beschreibung: "Confirm after checking the redeemer's name and timing.", optionen: [["--config <path>", "Configuration file path."], ["--key <path>", "Key file path."], ["--token <prefix>", "Select an invitation by the first 8 token characters."]] },
+  kontakte: { verwendung: "contacts --config <path> [--key <path>]", beschreibung: "Show confirmed contacts and invitations awaiting confirmation.", optionen: [["--config <path>", "Configuration file path."], ["--key <path>", "Verify current contact signing keys."]] },
   konto: { verwendung: "account --config <path> --key <path> [--wait <seconds>]", beschreibung: "Connect this agent to an account after confirmation.", optionen: [["--config <path>", "Configuration file path."], ["--key <path>", "Key file path."], ["--wait <seconds>", "Maximum wait time (default: 900)."]] },
+  connect: { verwendung: "connect <token|-> --dir <path> [--name <name>]", beschreibung: "Connect a new or existing agent to your account with a one-time token.", optionen: [["<token|->", "One-time token, or - to read it from standard input."], ["--name <name>", "Choose the agent name for a new setup."], ["--dir <path>", "Private setup directory."]] },
 };
 
 function hilfe(ausgewaehlterBefehl?: string): void {
@@ -405,7 +407,7 @@ function hilfe(ausgewaehlterBefehl?: string): void {
   }
   console.log([
     "Subspace is end-to-end encrypted. The post office never sees message contents.", "", "Subspace commands and options", "",
-    ...Object.values(befehlsHilfen).map(({ verwendung }) => `  subspace ${verwendung}`), "  help [command]", "  --version", "",
+    ...Object.values(befehlsHilfen).map(({ verwendung, beschreibung }) => `  subspace ${verwendung}  — ${beschreibung}`), "  help [command]", "  --version", "",
     "Run subspace <command> --help for command details.",
   ].join("\n"));
 }
@@ -413,7 +415,7 @@ function hilfe(ausgewaehlterBefehl?: string): void {
 function befehlsName(positionen: string[]): string | undefined {
   const alias: Record<string, string> = {
     setup: "setup", trust: "trust", accept: "annehmen", public: "oeffentlich", send: "senden", fetch: "fetch",
-    invite: "einladen", invites: "einladungen", open: "oeffnen", join: "join", confirm: "confirm", contacts: "kontakte", account: "konto",
+    invite: "einladen", invites: "einladungen", open: "oeffnen", join: "join", confirm: "confirm", contacts: "kontakte", account: "konto", connect: "connect",
   };
   const first = alias[positionen[0] ?? ""] ?? positionen[0];
   if (first === "key" && ["generate", "rotate", "revoke", "dispute"].includes(positionen[1] ?? "")) return `key ${positionen[1]}`;
@@ -436,6 +438,11 @@ export async function fuehreBefehlAus(args: string[]): Promise<void> {
     postamt: einzeln(options, "--postamt", true)!,
     ordner: einzeln(options, "--ordner", true)!,
   });
+  if (command === "connect") {
+    const token = options.positionen[1];
+    if (!token || options.positionen.length !== 2) throw new CliFehler(1, "A connect token is required.");
+    return connectAgent(token, { dir: einzeln(options, "--ordner", true)!, name: einzeln(options, "--name") });
+  }
   if (command === "trust") return trustContact({
     konfig: globalConfigPath(options),
     name: einzeln(options, "--name", true)!,

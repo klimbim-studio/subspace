@@ -54,6 +54,22 @@ async function baueNpmPaket(version?: string, cwd = wurzel, out?: string) {
   return run("bun", args, cwd);
 }
 
+async function kopierePaketQuellen(copy: string): Promise<void> {
+  for (const path of ["src", "paket", "package.json", "bun.lock", "tsconfig.json"]) {
+    const source = join(wurzel, path);
+    const dest = join(copy, path);
+    let info;
+    try { info = await stat(source); } catch { continue; }
+    await mkdir(join(dest, ".."), { recursive: true });
+    if (info.isDirectory()) {
+      const proc = Bun.spawnSync(["cp", "-R", source, join(dest, "..")]);
+      expect(proc.exitCode).toBe(0);
+    } else await copyFile(source, dest);
+  }
+  const installed = await run("bun", ["install", "--frozen-lockfile"], copy);
+  expect(installed.code).toBe(0);
+}
+
 afterEach(async () => {
   await Promise.all(tempRoots.splice(0).map((path) => rm(path, { recursive: true, force: true })));
 });
@@ -93,24 +109,9 @@ describe("npm-Paket", () => {
     expect(await readFile(join(out, "LICENSE"), "utf8")).toBe(license);
 
     const copy = await temp();
-    for (const path of ["src", "paket", "package.json", "bun.lock", "tsconfig.json"]) {
-      const source = join(wurzel, path);
-      const dest = join(copy, path);
-      let info;
-      try { info = await stat(source); } catch { continue; }
-      if (info.isDirectory()) {
-        await mkdir(join(dest, ".."), { recursive: true });
-        const proc = Bun.spawnSync(["cp", "-R", source, join(dest, "..")]);
-        expect(proc.exitCode).toBe(0);
-      } else {
-        await mkdir(join(dest, ".."), { recursive: true });
-        await copyFile(source, dest);
-      }
-    }
+    await kopierePaketQuellen(copy);
     await rm(join(copy, "paket/LICENSE"), { force: true });
     await rm(join(copy, "paket/LICENSE-SPDX"), { force: true });
-    const installed = await run("bun", ["install", "--frozen-lockfile"], copy);
-    expect(installed.code).toBe(0);
     const missingOut = join(copy, "temp-package");
     const missing = await baueNpmPaket("0.1.0", copy, missingOut);
     expect(missing.code).toBe(0);
@@ -128,6 +129,18 @@ describe("npm-Paket", () => {
     expect(missingLicenseManifest.files).not.toContain("LICENSE");
     expect(await Bun.file(join(missingLicenseOut, "LICENSE")).exists()).toBe(false);
     expect(missingLicense.stderr).toMatch(/license/i);
+
+    for (const content of ["", " \t\r\n "]) {
+      await writeFile(join(copy, "paket/LICENSE-SPDX"), content);
+      const emptyOut = join(copy, `empty-license-${content.length}`);
+      const empty = await baueNpmPaket("0.1.0", copy, emptyOut);
+      expect(empty.code).toBe(0);
+      const emptyManifest = JSON.parse(await readFile(join(emptyOut, "package.json"), "utf8"));
+      expect(emptyManifest.license).toBe("UNLICENSED");
+      expect(emptyManifest.files).not.toContain("LICENSE");
+      expect(await Bun.file(join(emptyOut, "LICENSE")).exists()).toBe(false);
+      expect(empty.stderr).toMatch(/license/i);
+    }
   });
 
   test("npm-version: gebündelte Version und Entwickler-Platzhalter", async () => {
@@ -190,6 +203,23 @@ describe("npm-Paket", () => {
       let exists = true;
       try { await stat(standard); } catch { exists = false; }
       expect(exists).toBe(false);
+    }
+  });
+
+  test("npm-out-riegel: --out darf nicht Repo-Wurzel oder Elternordner sein", async () => {
+    for (const outValue of [".", "..", "../.."]) {
+      const envelope = await temp();
+      const copy = join(envelope, "a/repo");
+      await mkdir(copy, { recursive: true });
+      await kopierePaketQuellen(copy);
+      await writeFile(join(copy, "MARKER"), "keep this marker\n");
+      await writeFile(join(envelope, "MARKER"), "keep envelope marker\n");
+      const result = await baueNpmPaket("0.1.0", copy, outValue);
+      expect(result.code).toBe(2);
+      expect(result.stderr).toContain("--out must not be the repository root or one of its parent directories.");
+      expect(await readFile(join(copy, "MARKER"), "utf8")).toBe("keep this marker\n");
+      expect(await readFile(join(envelope, "MARKER"), "utf8")).toBe("keep envelope marker\n");
+      expect(await Bun.file(join(copy, "src/paket/bauen.ts")).exists()).toBe(true);
     }
   });
 

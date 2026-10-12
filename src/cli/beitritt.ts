@@ -1,10 +1,8 @@
-import { createCipheriv, createHash, diffieHellman, generateKeyPairSync, hkdfSync, randomBytes } from "node:crypto";
-import { createPublicKey } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { chmod, link, lstat, mkdir, open, readFile, readdir, rename, unlink } from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import type { Stats } from "node:fs";
 import { existsSync, renameSync } from "node:fs";
-import { createInterface } from "node:readline/promises";
 import { text } from "node:stream/consumers";
 import { setTimeout as sleep } from "node:timers/promises";
 import { dirname, join } from "node:path";
@@ -12,7 +10,7 @@ import { fileURLToPath } from "node:url";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import {
   bestaetigungsNachricht,
-  code,
+  einladungsSchluessel,
   einloesungsNachricht,
   festlegung,
   oeffnungsNachricht,
@@ -44,6 +42,7 @@ interface EinladungZustand {
   box_I: string;
   c_I: string;
   n_I: string;
+  pk_s: string;
   zustand: "offen" | "geoeffnet" | "bestaetigt" | "verbrannt";
   fehler: number;
   sig_J?: string;
@@ -65,6 +64,7 @@ interface BeitrittZustand {
   n_J: string;
   n_I?: string;
   zustand: "eingeloest" | "wartet_auf_code" | "bestaetigt";
+  secret?: string;
 }
 
 interface LinkDaten {
@@ -72,6 +72,7 @@ interface LinkDaten {
   token: string;
   fp: string;
   sha?: string;
+  secret?: string;
 }
 
 interface OeffentlicheEinladung {
@@ -81,6 +82,7 @@ interface OeffentlicheEinladung {
   box_I: string;
   fuer: string;
   c: string;
+  pk_s: string;
   ablauf: string;
   zustand: string;
 }
@@ -150,6 +152,7 @@ function fehlerAntwort(response: Response, value: unknown): CliFehler {
   if (response.status >= 300 && response.status < 400) return new CliFehler(2, "Post office redirect was rejected.");
   if (response.status === 408) return new CliFehler(2, "Post office request timed out.");
   if (response.status === 404) return new CliFehler(2, "Invitation is no longer valid.");
+  if (response.status === 410 && object(value) && value.grund === "invitation_outdated") return new CliFehler(3, "This invitation was made with an older version. Ask for a new one.");
   if (response.status === 409) {
     const reason = object(value)
       ? (typeof value.meldung === "string" ? value.meldung : typeof value.grund === "string" ? value.grund : "Conflict")
@@ -221,19 +224,30 @@ async function publicJson(url: string, method = "GET", body?: unknown): Promise<
 
 function parseLink(raw: string): LinkDaten {
   let url: URL;
-  try { url = new URL(raw); } catch { throw new CliFehler(1, "Invalid invitation link."); }
+  try {
+    const address = /^[A-Za-z0-9.-]+(?::[0-9]+)?\//.test(raw) ? `${raw.startsWith("localhost") || raw.startsWith("127.0.0.1") ? "http://" : "https://"}${raw}` : raw;
+    url = new URL(address);
+  } catch { throw new CliFehler(1, "Invalid agent line. Use the agent line, not the browser address."); }
   if (url.protocol !== "https:" && !(url.protocol === "http:" && ["127.0.0.1", "localhost"].includes(url.hostname))) {
-    throw new CliFehler(1, `Unsupported protocol in invitation link: ${url.protocol}`);
+    throw new CliFehler(1, `Unsupported protocol in agent line: ${url.protocol}`);
   }
-  if (url.username || url.password || url.search) {
-    throw new CliFehler(1, "Invalid invitation link.");
+  if (url.username || url.password) {
+    throw new CliFehler(1, "Invalid agent line.");
   }
   const match = /^\/e\/([A-Za-z0-9_-]{22})$/.exec(url.pathname);
   if (!match) throw new CliFehler(1, "Invalid invitation link.");
   bytes(match[1]!, 16);
-  const fragment = /^fp=([a-f0-9]{64})(?:&sha=([a-f0-9]{64}))?$/.exec(url.hash.slice(1));
-  if (!fragment) throw new CliFehler(1, "Invalid invitation link.");
-  return { instanz: url.origin, token: match[1]!, fp: fragment[1]!, ...(fragment[2] ? { sha: fragment[2] } : {}) };
+  const legacy = /^#fp=([a-f0-9]{64})&sha=([a-f0-9]{64})$/.exec(url.hash);
+  const secret = url.searchParams.get("s");
+  const fp = url.searchParams.get("fp") ?? legacy?.[1];
+  const sha = url.searchParams.get("sha") ?? legacy?.[2];
+  const keys = [...url.searchParams.keys()].sort().join(",");
+  if (!fp || !sha || !/^[a-f0-9]{64}$/.test(fp) || !/^[a-f0-9]{64}$/.test(sha)
+    || (secret ? keys !== "fp,s,sha" || url.hash !== "" : keys !== "" && keys !== "fp,sha")) {
+    throw new CliFehler(1, "Browser address is incomplete; use the agent line from the invitation.");
+  }
+  if (secret) bytes(secret, 32);
+  return { instanz: url.origin, token: match[1]!, fp, sha, ...(secret ? { secret } : {}) };
 }
 
 function einladungProtocol(state: EinladungZustand): Beitrittsprotokoll {
@@ -475,18 +489,21 @@ async function einladen(options: BeitrittOptionen): Promise<void> {
   const script = einzel(options, "--skript") ?? (typeof process.argv[1] === "string" && /\.js$/i.test(process.argv[1]) ? process.argv[1] : undefined);
   if (!script) throw new CliFehler(1, "SHA-256 of the running script is unavailable; specify --script.");
   const invitation = await erstelleEinladung(config, key, fuer, script);
-  console.log(invitation.link);
-  console.log("Send the link through a channel you both trust (Signal, personal email), not through Subspace.");
+  console.log(`Browser address: ${invitation.browserAddress}`);
+  console.log(`Agent line: ${invitation.agentLine}`);
+  console.log("Give the agent line only to the invited person's own agent; never enter it in a browser.");
 }
 
-async function erstelleEinladung(config: Konfiguration, key: Schluessel, fuer: string, script: string): Promise<{ token: string; link: string }> {
+async function erstelleEinladung(config: Konfiguration, key: Schluessel, fuer: string, script: string): Promise<{ token: string; browserAddress: string; agentLine: string }> {
   if (!/^[a-z][a-z0-9-]{1,31}$/.test(fuer) || fuer === config.name) throw new CliFehler(1, "Invalid invitation name.");
   const instanz = new URL(config.postamt).origin;
   const token = b64url(randomBytes(16));
   const nI = randomBytes(32);
+  const secret = randomBytes(32);
+  const signing = einladungsSchluessel(secret);
   const sigI = key.signaturOeffentlich;
   const boxI = key.boxOeffentlich;
-  const cI = festlegung(instanz, new Uint8Array(Buffer.from(token, "base64url")), config.name, sigI, boxI, nI);
+  const cI = festlegung(instanz, new Uint8Array(Buffer.from(token, "base64url")), config.name, sigI, boxI, nI, signing.publicKey);
   let sha: string;
   try { sha = createHash("sha256").update(await readFile(script)).digest("hex"); }
   catch { throw new CliFehler(1, "Could not read the script for its SHA-256 fingerprint; check --script."); }
@@ -495,16 +512,19 @@ async function erstelleEinladung(config: Konfiguration, key: Schluessel, fuer: s
   const local: EinladungZustand = {
     art: "einladung", token, instanz, name_I: config.name, fuer,
     sig_I: b64url(sigI), box_I: b64url(boxI), c_I: b64url(cI), n_I: b64url(nI),
+    pk_s: b64url(signing.publicKey),
     zustand: "offen", fehler: 0,
   };
   const response = await signedJson(config.postamt, "/v1/einladung", "POST", {
-    token, fuer, c: b64url(cI), box: b64url(boxI),
+    token, fuer, c: b64url(cI), box: b64url(boxI), pk_s: b64url(signing.publicKey),
   }, config, key);
   if (!object(response) || response.token !== token) throw new CliFehler(2, "Invalid response from the post office.");
   await schreibeZustand(statePath(config, "invitations", token), local);
   const fingerprint = fingerprintWithoutSpaces(fingerabdruck(sigI, boxI));
-  const link = `${instanz}/e/${token}#fp=${fingerprint}&sha=${sha}`;
-  return { token, link };
+  const browserAddress = `${instanz}/e/${token}`;
+  const authority = new URL(instanz).host;
+  const agentLine = `${authority}/e/${token}?s=${b64url(secret)}&fp=${fingerprint}&sha=${sha}`;
+  return { token, browserAddress, agentLine };
 }
 
 
@@ -537,7 +557,7 @@ export async function bearbeiteEinladungsauftraege(config: Konfiguration, key: S
   };
   const validCandidates = result.auftraege.filter((candidate): candidate is Record<string, unknown> => object(candidate)
     && typeof candidate.id === "string" && /^[a-f0-9]{32}$/.test(candidate.id)
-    && typeof candidate.fuer === "string" && typeof candidate.browser_schluessel === "object" && Boolean(candidate.browser_schluessel));
+    && typeof candidate.fuer === "string");
   const toBurn = validCandidates.filter((candidate) => candidate.zustand === "verworfen" && typeof candidate.token === "string").slice(0, 10);
   const toCreate = validCandidates.filter((candidate) => candidate.zustand === "offen").slice(0, 3);
   for (const candidate of [...toBurn, ...toCreate]) {
@@ -551,30 +571,15 @@ export async function bearbeiteEinladungsauftraege(config: Konfiguration, key: S
       const fuer = candidate.fuer as string;
       const invitation = await erstelleEinladung(config, key, fuer, fileURLToPath(import.meta.url));
       createdToken = invitation.token;
-      const context = Buffer.from(`${candidate.id}|${new URL(config.postamt).origin}|${fuer}`);
-      const browserKey = candidate.browser_schluessel as Record<string, unknown>;
-      if (browserKey.kty !== "EC" || browserKey.crv !== "P-256" || typeof browserKey.x !== "string" || typeof browserKey.y !== "string") throw new TypeError("Invalid browser key.");
-      const browserPublic = createPublicKey({ key: browserKey as JsonWebKey, format: "jwk" });
-      const ephemeral = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
-      const secret = diffieHellman({ privateKey: ephemeral.privateKey, publicKey: browserPublic });
-      const salt = randomBytes(32);
-      const iv = randomBytes(12);
-      const aesKey = Buffer.from(hkdfSync("sha256", secret, salt, context, 32));
-      const cipher = createCipheriv("aes-256-gcm", aesKey, iv);
-      cipher.setAAD(context);
-      const ciphertext = Buffer.concat([cipher.update(invitation.link, "utf8"), cipher.final(), cipher.getAuthTag()]);
-      const chiffrat = {
-        publicKey: ephemeral.publicKey.export({ format: "jwk" }),
-        salt: b64url(salt), iv: b64url(iv), ciphertext: b64url(ciphertext),
-      };
-      const uploaded = await signedJson(config.postamt, `/v1/einladungsauftraege/${candidate.id}`, "POST", { token: invitation.token, chiffrat }, config, key);
+      const uploaded = await signedJson(config.postamt, `/v1/einladungsauftraege/${candidate.id}`, "POST", { token: invitation.token }, config, key);
       if (!object(uploaded) || uploaded.status !== "erzeugt") throw new CliFehler(2, "Invitation task upload failed.");
       outcome = "erzeugt";
+      console.log(JSON.stringify({ invitation_tasks: { name: fuer, browser_address: invitation.browserAddress, agent_line: invitation.agentLine } }));
     } catch {
       if (createdToken) await verbrenne(createdToken);
       outcome = "fehler";
     }
-    console.log(JSON.stringify({ invitation_task_id: candidate.id, for: candidate.fuer, result: outcome === "erzeugt" ? "created" : "error" }));
+    if (outcome !== "erzeugt") console.log(JSON.stringify({ invitation_task_id: candidate.id, for: candidate.fuer, result: "error" }));
   }
 }
 
@@ -605,6 +610,16 @@ async function einladungen(options: BeitrittOptionen): Promise<void> {
           if (typeof remote.einloesung.fingerabdruck !== "string" || remote.einloesung.fingerabdruck !== fingerprint) {
             console.error(`ALARM Post office: Redemption fingerprint does not match for ${kurzesToken(local.token)}.`);
           }
+          if (typeof remote.einloesung.sig_s === "string" && typeof remote.einloesung.n_J === "string") {
+            const protocol = {
+              instanz: local.instanz, token: bytes(local.token, 16), name_J: local.fuer,
+              sig_J: bytes(remote.einloesung.sig_J, 32), box_J: bytes(remote.einloesung.box_J, 32),
+              c_I: bytes(local.c_I, 32), n_J: bytes(remote.einloesung.n_J, 32),
+            };
+            const valid = ed25519.verify(bytes(remote.einloesung.sig_s, 64), einloesungsNachricht(protocol), bytes(local.pk_s, 32));
+            if (valid) console.log(`${local.fuer} redeemed your invitation. Fingerprint ${fingerprint}. Accept with: subspace confirm ${local.fuer}`);
+            else console.error(`Warning: invalid redemption for ${local.fuer}; verify before confirming.`);
+          }
         } catch {
           console.error(`ALARM Post office: Invalid redemption fingerprint for ${kurzesToken(local.token)}.`);
           fingerprint = null;
@@ -622,11 +637,15 @@ async function einladungen(options: BeitrittOptionen): Promise<void> {
     }
   }
   for (const warning of result.meldungen) {
+    if (object(warning) && warning.grund === "zweite_einloesung" && typeof warning.token === "string") {
+      const invitation = localInvitations.find((candidate) => candidate.token === warning.token);
+      if (invitation) console.error(`Warning: ${invitation.fuer} redeemed this invitation again; the confirmed contact remains unchanged.`);
+    }
     console.error(druckbar(`ALARM Post office: ${JSON.stringify(warning, (key, value: unknown) => key === "token" && typeof value === "string" ? kurzesToken(value) : value)}`));
   }
 }
 
-async function oeffnen(options: BeitrittOptionen): Promise<void> {
+async function oeffnenIntern(options: BeitrittOptionen): Promise<void> {
   const configPath = einzel(options, "--config", true)!;
   const config = await ladeKonfiguration(configPath);
   const key = await ladeSchluessel(einzel(options, "--key", true)!);
@@ -653,8 +672,15 @@ async function oeffnen(options: BeitrittOptionen): Promise<void> {
     }
     if (local.zustand === "bestaetigt" || local.zustand === "verbrannt") throw new CliFehler(3, "ALARM: Invitation can no longer be opened.");
     if (!object(remote.einloesung)) throw new CliFehler(3, "Invitation has not been validly redeemed yet.");
+    if (typeof remote.pk_s !== "string" || remote.pk_s !== local.pk_s) {
+      await schreibeZustand(localPath, { ...local, zustand: "verbrannt" });
+      const burned = await signedFetch(config.postamt, `/v1/einladung/${token}/verbrennen`, "POST", new Uint8Array(), config, key).catch(() => undefined);
+      console.error("Warning: post office invitation key does not match local state; invitation burned.");
+      if (!burned?.ok) console.error("Warning: post office could not confirm that the invitation was burned.");
+      throw new CliFehler(3, "Invalid invitation secret key from the post office.");
+    }
     const redemption = remote.einloesung;
-    if (typeof redemption.sig_J !== "string" || typeof redemption.box_J !== "string" || typeof redemption.n_J !== "string" || typeof redemption.beleg !== "string") {
+    if (typeof redemption.sig_J !== "string" || typeof redemption.box_J !== "string" || typeof redemption.n_J !== "string" || typeof redemption.beleg !== "string" || typeof redemption.sig_s !== "string") {
       throw new CliFehler(3, "Invalid redemption receipt.");
     }
     const sigJ = bytes(redemption.sig_J, 32);
@@ -672,6 +698,18 @@ async function oeffnen(options: BeitrittOptionen): Promise<void> {
       }), sigJ);
     } catch { }
     if (!valid) throw new CliFehler(3, "Invalid redemption receipt.");
+    let validSecret = false;
+    try { validSecret = ed25519.verify(bytes(redemption.sig_s, 64), einloesungsNachricht({
+      instanz: local.instanz, token: bytes(local.token, 16), name_J: local.fuer,
+      sig_J: sigJ, box_J: boxJ, c_I: bytes(local.c_I, 32), n_J: nJ,
+    }), bytes(local.pk_s, 32)); } catch { }
+    if (!validSecret) {
+      await schreibeZustand(localPath, { ...local, zustand: "verbrannt" });
+      const burned = await signedFetch(config.postamt, `/v1/einladung/${token}/verbrennen`, "POST", new Uint8Array(), config, key).catch(() => undefined);
+      console.error("Warning: invitation secret signature is invalid; invitation burned.");
+      if (!burned?.ok) console.error("Warning: post office could not confirm that the invitation was burned.");
+      throw new CliFehler(3, "Invalid invitation secret signature.");
+    }
 
     let opened = local;
     if (local.zustand === "geoeffnet") {
@@ -712,8 +750,13 @@ async function oeffnen(options: BeitrittOptionen): Promise<void> {
   }
 }
 
+async function oeffnen(options: BeitrittOptionen): Promise<void> {
+  const name = options.positionen[1] ?? "<name>";
+  throw new CliFehler(1, `open is no longer needed. Use: subspace confirm ${name}`);
+}
+
 async function linkVonStdin(options: BeitrittOptionen): Promise<LinkDaten> {
-  if (einzel(options, "--link", true) !== "-") throw new CliFehler(1, "--link must be '-'.");
+  if (options.positionen[1] !== "-" && einzel(options, "--link") !== "-") throw new CliFehler(1, "Use join - to read the agent line from standard input.");
   let raw: string;
   try { raw = (await text(process.stdin)).trim(); } catch { throw new CliFehler(1, "Could not read the invitation link."); }
   return parseLink(raw);
@@ -728,10 +771,13 @@ async function pruefeLink(link: LinkDaten): Promise<OeffentlicheEinladung> {
     || typeof value.fuer !== "string" || typeof value.c !== "string" || typeof value.ablauf !== "string" || typeof value.zustand !== "string") {
     throw new CliFehler(2, "Could not retrieve the invitation securely.");
   }
+  if (typeof value.pk_s !== "string" || !link.secret) throw new CliFehler(3, "This invitation was made with an older version. Ask for a new one.");
   const invitation = value as unknown as OeffentlicheEinladung;
   const sigI = bytes(invitation.sig_I, 32);
   const boxI = bytes(invitation.box_I, 32);
   bytes(invitation.c, 32);
+  const derived = einladungsSchluessel(bytes(link.secret, 32));
+  if (Buffer.compare(Buffer.from(derived.publicKey), Buffer.from(bytes(invitation.pk_s, 32))) !== 0) throw new CliFehler(3, "Agent line does not match the invitation secret.");
   if (invitation.instanz !== link.instanz) throw new CliFehler(3, "Post office instance does not match the link.");
   if (fingerprintWithoutSpaces(fingerabdruck(sigI, boxI)) !== link.fp) throw new CliFehler(3, "Fingerprint does not match.");
   return invitation;
@@ -762,14 +808,13 @@ async function wartenAufOeffnung(config: Konfiguration, local: BeitrittZustand, 
         sig_I: bytes(local.sig_I, 32), box_I: bytes(local.box_I, 32), sig_J: bytes(local.sig_J, 32),
         box_J: bytes(local.box_J, 32), c_I: bytes(local.c_I, 32), n_J: bytes(local.n_J, 32), n_I: nI,
       };
-      if (Buffer.compare(Buffer.from(festlegung(local.instanz, protocol.token, local.name_I, protocol.sig_I, protocol.box_I, nI)), Buffer.from(protocol.c_I)) !== 0
+      const secret = local.secret ? bytes(local.secret, 32) : undefined;
+      if (!secret || Buffer.compare(Buffer.from(festlegung(local.instanz, protocol.token, local.name_I, protocol.sig_I, protocol.box_I, nI, einladungsSchluessel(secret).publicKey)), Buffer.from(protocol.c_I)) !== 0
         || !ed25519.verify(signature, oeffnungsNachricht(protocol), protocol.sig_I)) throw new CliFehler(3, "Invalid opening from the inviter.");
       const updated = { ...local, n_I: b64url(nI), zustand: "wartet_auf_code" as const };
       await schreibeZustand(statePath(config, "joins", local.token), updated);
-      console.log(`Code: ${code(protocol)}`);
       console.log(`Fingerprint I: ${fingerprintWithoutSpaces(fingerabdruck(protocol.sig_I, protocol.box_I)).slice(0, 8)}`);
-      console.log("Read the code to the inviter over the phone. They enter it on their side.");
-      console.log(`Next: subspace join --resume --config ${shellWert(configPath)} --key ${shellWert(keyPath)}`);
+      console.log("Waiting for the inviter to confirm.");
       return updated;
     }
     if (!response.ok && response.status !== 202) throw fehlerAntwort(response, value);
@@ -783,15 +828,18 @@ function fortsetzenFehler(fehler: CliFehler, pathConfig: string, pathKey: string
 }
 
 async function sendeEinloesung(local: BeitrittZustand, key: Schluessel, path: string, pathConfig: string, pathKey: string): Promise<void> {
-  const proof = ed25519.sign(einloesungsNachricht({
+  const message = einloesungsNachricht({
     instanz: local.instanz, token: bytes(local.token, 16), name_J: local.name_J,
     sig_J: bytes(local.sig_J, 32), box_J: bytes(local.box_J, 32),
     c_I: bytes(local.c_I, 32), n_J: bytes(local.n_J, 32),
-  }), key.signaturPrivat);
+  });
+  const proof = ed25519.sign(message, key.signaturPrivat);
+  if (!local.secret) throw new CliFehler(3, "Join state is missing the invitation secret.");
+  const secretSignature = ed25519.sign(message, einladungsSchluessel(bytes(local.secret, 32)).secretKey);
   let redeemed: { response: Response; value: unknown };
   try {
     redeemed = await publicJson(`${local.instanz}/v1/einladung/${local.token}/einloesen`, "POST", {
-      sig_J: local.sig_J, box_J: local.box_J, n_J: local.n_J, beleg: b64url(proof),
+      sig_J: local.sig_J, box_J: local.box_J, n_J: local.n_J, beleg: b64url(proof), sig_s: b64url(secretSignature),
     });
   } catch (error) {
     const failure = error instanceof CliFehler ? error : new CliFehler(2, "Post office request failed.");
@@ -832,7 +880,7 @@ async function pruefeFortsetzenUndLoese(local: BeitrittZustand, key: Schluessel,
   }
   const zustand = invitation.value.zustand;
   if (zustand === "offen") return sendeEinloesung(local, key, path, pathConfig, pathKey);
-  if (zustand === "eingeloest" || zustand === "geoeffnet") return;
+  if (zustand === "eingeloest" || zustand === "geoeffnet" || zustand === "bestaetigt") return;
   if (zustand === "verbrannt" || zustand === "abgelaufen") {
     await unlink(path).catch(() => undefined);
     throw new CliFehler(3, "Invitation has been used or expired; request a new one.");
@@ -841,7 +889,12 @@ async function pruefeFortsetzenUndLoese(local: BeitrittZustand, key: Schluessel,
 }
 
 async function joinLink(options: BeitrittOptionen): Promise<void> {
-  const link = await linkVonStdin(options);
+  let link: LinkDaten;
+  const input = options.positionen[1];
+  if (input === "-") link = await linkVonStdin(options);
+  else if (input) link = parseLink(input);
+  else if (einzel(options, "--link") === "-") link = await linkVonStdin(options);
+  else throw new CliFehler(1, "Provide the agent line or use join - to read it from standard input.");
   if (link.sha) {
     console.log(`Link checksum: ${link.sha}`);
     if (typeof process.argv[1] === "string" && /\.js$/i.test(process.argv[1])) {
@@ -892,7 +945,7 @@ async function joinLink(options: BeitrittOptionen): Promise<void> {
     art: "beitritt", token: link.token, instanz: link.instanz,
     name_I: invitation.einladender, name_J: invitation.fuer,
     sig_I: b64url(bytes(invitation.sig_I, 32)), box_I: b64url(bytes(invitation.box_I, 32)), c_I: b64url(cI),
-    sig_J: b64url(sigJ), box_J: b64url(boxJ), n_J: b64url(nJ), zustand: "eingeloest",
+    sig_J: b64url(sigJ), box_J: b64url(boxJ), n_J: b64url(nJ), zustand: "eingeloest", secret: link.secret,
   };
   const root = stateRoot(config, "joins");
   await bereiteZustandsordnerVor(root);
@@ -904,7 +957,8 @@ async function joinLink(options: BeitrittOptionen): Promise<void> {
   }
   await schreibeZustand(path, local);
   await sendeEinloesung(local, loadedKey, path, pathConfig, pathKey);
-  await wartenAufOeffnung(config, local, await codeEmpfangen(options), pathConfig, pathKey);
+  const opened = await wartenAufOeffnung(config, local, await codeEmpfangen(options), pathConfig, pathKey);
+  await wartenAufBestaetigung(config, loadedKey, pathConfig, opened, await codeEmpfangen(options));
 }
 
 async function wartenAufBestaetigung(config: Konfiguration, key: Schluessel, configPath: string, local: BeitrittZustand, waitSeconds: number): Promise<void> {
@@ -965,6 +1019,7 @@ async function confirm(options: BeitrittOptionen): Promise<void> {
   const key = await ladeSchluessel(einzel(options, "--key", true)!);
   const prefix = einzel(options, "--token");
   if (prefix !== undefined && !/^[A-Za-z0-9_-]{8}$/.test(prefix)) throw new CliFehler(1, "--token must contain the first 8 token characters.");
+  await oeffnenIntern(options);
   const directory = stateRoot(config, "invitations");
   const names = await readdir(directory).catch(() => []);
   const candidateNames = names.filter((name) => /^[A-Za-z0-9_-]{22}\.json$/.test(name));
@@ -1024,25 +1079,6 @@ async function confirm(options: BeitrittOptionen): Promise<void> {
   };
 
   if (await bestaetigungAbrufen()) return;
-  let input: string;
-  if (process.stdin.isTTY) {
-    const prompt = createInterface({ input: process.stdin, output: process.stdout });
-    try { input = (await prompt.question("Six-digit code: ")).trim(); }
-    finally { prompt.close(); }
-  } else {
-    input = (await text(process.stdin)).split(/\r?\n/, 1)[0]?.trim() ?? "";
-  }
-  if (!/^\d{6}$/.test(input)) throw new CliFehler(1, "Enter the six-digit code.");
-  if (input !== code(protocol)) {
-    local.fehler += 1;
-    if (local.fehler >= 3) local.zustand = "verbrannt";
-    await schreibeZustand(localFile, local);
-    if (local.fehler >= 3) {
-      const response = await signedFetch(config.postamt, `/v1/einladung/${local.token}/verbrennen`, "POST", new Uint8Array(), config, key).catch(() => undefined);
-      if (!response?.ok) throw new CliFehler(3, "Third incorrect code; could not safely burn the invitation.");
-    }
-    throw new CliFehler(3, "Incorrect code.");
-  }
   const signature = ed25519.sign(bestaetigungsNachricht(protocol), key.signaturPrivat);
   try {
     const result = await signedJson(config.postamt, `/v1/einladung/${local.token}/bestaetigung`, "POST", { unterschrift: b64url(signature) }, config, key);
@@ -1080,17 +1116,17 @@ async function kontakte(options: BeitrittOptionen): Promise<void> {
     }
     console.log(JSON.stringify(contact));
   }
-  console.log("Waiting for code:");
+  console.log("Waiting for confirmation:");
   for (const kind of ["invitations", "joins"] as const) {
     const root = stateRoot(config, kind);
     const names = await readdir(root).catch(() => []);
     for (const name of names.filter((entry) => /^[A-Za-z0-9_-]{22}\.json$/.test(entry))) {
       if (kind === "invitations") {
         const state = await leseZustand<EinladungZustand>(join(root, name));
-        if (state.zustand === "geoeffnet") console.log(JSON.stringify({ name: state.fuer, state: "waiting for code", token: kurzesToken(state.token) }));
+        if (state.zustand === "geoeffnet") console.log(JSON.stringify({ name: state.fuer, state: "waiting for confirmation", token: kurzesToken(state.token) }));
       } else {
         const state = await leseZustand<BeitrittZustand>(join(root, name));
-        if (state.zustand === "wartet_auf_code") console.log(JSON.stringify({ name: state.name_I, state: "waiting for code", token: kurzesToken(state.token) }));
+        if (state.zustand === "wartet_auf_code") console.log(JSON.stringify({ name: state.name_I, state: "waiting for confirmation", token: kurzesToken(state.token) }));
       }
     }
   }

@@ -6,7 +6,7 @@ async function drosselt(response: Response): Promise<boolean> {
   if (response.status !== 429) return false;
   try {
     const body: unknown = await response.clone().json();
-    if (body && typeof body === "object" && !Array.isArray(body) && Object.hasOwn(body, "grund")) return false;
+    if (body && typeof body === "object" && !Array.isArray(body) && (Object.hasOwn(body, "grund") || Object.hasOwn(body, "reason"))) return false;
   } catch {
     // Non-JSON gateway responses are retriable.
   }

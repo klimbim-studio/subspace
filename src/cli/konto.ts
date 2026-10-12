@@ -62,6 +62,7 @@ async function kontoFehler(response: Response): Promise<string | undefined> {
     if (!objekt(body)) return undefined;
     if (typeof body.error === "string") return body.error;
     if (typeof body.grund === "string") return body.grund;
+    if (typeof body.reason === "string") return body.reason;
   } catch {
     return undefined;
   }
