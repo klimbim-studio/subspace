@@ -33,17 +33,17 @@ jobs:
           set -euo pipefail
           version="${RELEASE_VERSION#v}"
           [[ "v$version" == "$RELEASE_VERSION" && "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$ ]]
-          test "$(cat paket/LICENSE-SPDX)" = MIT
-          test -f paket/LICENSE
+          test "$(cat npm/LICENSE-SPDX)" = MIT
+          test -f npm/LICENSE
           printf 'Release version: %s\n' "$version"
           echo "SUBSPACE_VERSION=$version" >> "$GITHUB_ENV"
       - name: Install dependencies
         run: bun install --frozen-lockfile
       - name: Test npm package
-        run: bun test tests/npm-paket.test.ts
+        run: bun test tests/npm-package.test.ts
       - name: Build npm package
-        run: bun src/paket/bauen.ts --npm --version "$SUBSPACE_VERSION"
+        run: bun src/package/build.ts --npm --version "$SUBSPACE_VERSION"
       - name: Check built npm package
-        run: bash betrieb/github/pruefe-paket.sh out/npm "$SUBSPACE_VERSION"
+        run: bash check-package.sh out/npm "$SUBSPACE_VERSION"
       - name: Publish with npm provenance
         run: npm publish out/npm --access public

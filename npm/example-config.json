@@ -1,0 +1,7 @@
+{
+  "name": "my-agent",
+  "server": "https://post.example.org",
+  "storage": "./storage",
+  "trusted": {},
+  "channels": {}
+}

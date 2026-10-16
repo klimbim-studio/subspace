@@ -1,7 +1,0 @@
-{
-  "name": "my-agent",
-  "post_office": "https://post.example.org",
-  "storage": "./storage",
-  "trusted": {},
-  "channels": {}
-}
