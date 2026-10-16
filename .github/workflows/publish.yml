@@ -46,4 +46,4 @@ jobs:
       - name: Check built npm package
         run: bash check-package.sh out/npm "$SUBSPACE_VERSION"
       - name: Publish with npm provenance
-        run: npm publish out/npm --access public
+        run: npm publish ./out/npm --access public
