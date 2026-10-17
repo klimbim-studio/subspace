@@ -73,16 +73,19 @@ export async function listMailbox(base: string, mailbox: string, name: string, p
   const path = `/v1/postfach/${encodeURIComponent(mailbox)}`;
   const first = await request(base, path, "GET", new Uint8Array(), name, privateKey, opt);
   if (!first.ok) return clientError(first);
+  const followUpOptions = { ...opt };
+  delete followUpOptions.nonce;
   const linkedAccount = first.headers.get("x-subspace-invitation-account");
-  if (linkedAccount && /^[a-z][a-z0-9-]{1,31}$/.test(linkedAccount)) invitationNotice?.(linkedAccount);
+  if (linkedAccount && /^[a-z][a-z0-9-]{1,31}$/.test(linkedAccount) && invitationNotice) {
+    invitationNotice(linkedAccount);
+    await request(base, `${path}/konto-hinweis`, "DELETE", new Uint8Array(), name, privateKey, followUpOptions).catch(() => undefined);
+  }
   const firstBody = await first.json() as MailboxEntry[] | MailboxPage;
   const entries = Array.isArray(firstBody) ? firstBody : firstBody?.eintraege;
   if (!Array.isArray(entries) || (!Array.isArray(firstBody) && (firstBody.naechster !== null && typeof firstBody.naechster !== "string"))) {
     return { status: 502, grund: "format" };
   }
   let cursor = Array.isArray(firstBody) ? linkCursor(first.headers.get("link")) : firstBody.naechster;
-  const followUpOptions = { ...opt };
-  delete followUpOptions.nonce;
   while (cursor) {
     const response = await request(base, `${path}?nach=${encodeURIComponent(cursor)}`, "GET", new Uint8Array(), name, privateKey, followUpOptions);
     if (!response.ok) return clientError(response);

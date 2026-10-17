@@ -847,8 +847,12 @@ async function waitForInvitationOpen(config: Configuration, local: JoinState, wa
         box_J: bytes(local.box_J, 32), c_I: bytes(local.c_I, 32), n_J: bytes(local.n_J, 32), n_I: nI,
       };
       const secret = local.secret ? bytes(local.secret, 32) : undefined;
-      if (!secret || Buffer.compare(Buffer.from(createJoinCommitment(local.instanz, protocol.token, local.name_I, protocol.sig_I, protocol.box_I, nI, deriveInvitationKey(secret).publicKey)), Buffer.from(protocol.c_I)) !== 0
-        || !ed25519.verify(signature, openingMessage(protocol), protocol.sig_I)) throw new CliError(3, "Invalid opening from the inviter.");
+      if (!secret || Buffer.compare(Buffer.from(createJoinCommitment(local.instanz, protocol.token, local.name_I, protocol.sig_I, protocol.box_I, nI, deriveInvitationKey(secret).publicKey)), Buffer.from(protocol.c_I)) !== 0) {
+        throw new CliError(3, "Invalid opening from the inviter.");
+      }
+      if (!ed25519.verify(signature, openingMessage(protocol), protocol.sig_I)) {
+        throw new CliError(3, "ALARM: Invalid opening from the inviter. It does not match your key, so someone else may have redeemed this agent line. Tell the inviter not to confirm this join, and ask for a new invitation.");
+      }
       const updated = { ...local, n_I: b64url(nI), zustand: "wartet_auf_code" as const };
       await writeState(statePath(config, "joins", local.token), updated);
       console.log(`Fingerprint I: ${fingerprintWithoutSpaces(fingerprint(protocol.sig_I, protocol.box_I)).slice(0, 8)}`);
