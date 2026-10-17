@@ -24,8 +24,9 @@ import { acceptKey, verifyRecipientKeys, rotateKey, disputeKey, revokeKey } from
 import { processInvitationTasks, runJoinCommand } from "./join.ts";
 import { runAccountCommand } from "./account.ts";
 import { connect as connectAgent } from "./connect.ts";
-import { groupAdmissionCode, createGroupNonce, hashGroupLeave, hashGroupState, hashGroupConsent, parseGroupLeave, parseGroupState, verifyGroupLeave, verifyGroupInvitation, verifyGroupConsent, verifyGroupState, validateRevision, createGroupId, signGroupLeave, signGroupInvitation, signGroupConsent, signGroupState, groupStateJson, type GroupInvitation, type SignedGroupState } from "../group.ts";
+import { groupAdmissionCode, createGroupNonce, hashGroupLeave, hashGroupState, hashGroupConsent, parseGroupLeave, parseGroupState, verifyGroupLeave, verifyGroupInvitation, verifyGroupConsent, verifyGroupState, validateRevision, createGroupId, signGroupLeave, signGroupInvitation, signGroupConsent, signGroupState, groupStateJson, MAX_GROUP_MEMBERS, type GroupInvitation, type SignedGroupState } from "../group.ts";
 import { groupsFilePath, loadGroups, saveGroups, setGroupState, requireActiveHead } from "./group.ts";
+import { GROUP_INVITATION_TTL_MS, GroupInvitationSendError, invitationJson, protocolText, queueOrSendGroupInvitation, sendGroupInvitation, sendGroupProtocol, sendNextQueuedGroupInvitation } from "./group-invitations.ts";
 
 interface CliOptions {
   positionals: string[];
@@ -74,7 +75,7 @@ function parseOptions(args: string[]): CliOptions {
       positionalArgs.push(arg);
       continue;
     }
-    if (arg === "--help" || arg === "--resume" || arg === "--skip-invitation-tasks") {
+    if (arg === "--help" || arg === "--resume" || arg === "--skip-invitation-tasks" || arg === "--now") {
       switches.add(arg);
       continue;
     }
@@ -341,23 +342,6 @@ function protocolMessage(text: string): Record<string, unknown> | undefined {
   } catch { return; }
 }
 
-function protocolText(type: string, body: Record<string, unknown>): string {
-  return GROUP_PROTOCOL_PREFIX + JSON.stringify({ version: 1, type, body });
-}
-
-async function sendGroupProtocol(configuration: Configuration, signingKey: KeyPair, recipient: string, message: string): Promise<void> {
-  const trusted = configuration.trusted[recipient];
-  if (!trusted) throw new CliError(4, "Group pairing requires a direct trusted contact.");
-  const now = new Date();
-  const envelope: Envelope = {
-    v: 1, id: randomBytes(16).toString("hex"), von: configuration.name, an: [recipient], kanal: null,
-    erstellt: now.toISOString(), gueltig_bis: new Date(now.getTime() + 7 * 86400000).toISOString(),
-    art: "info", bezug: null, betreff: "Group pairing", text: message, anhaenge: [],
-  };
-  const result = await submitMessage(configuration.server, sealEnvelope(envelope, signingKey, { [recipient]: trusted.box }), configuration.name, signingKey.signaturPrivat);
-  if (isClientError(result)) throw new CliError(2, "Could not send the group pairing message.");
-}
-
 function parseInvitation(value: unknown): GroupInvitation | undefined {
   if (!isObject(value) || Object.keys(value).sort().join(",") !== "fuer,gid,stand_hash,unterschrift,zeit" /* wire format, keep */
     || typeof value.gid !== "string" || typeof value.fuer !== "string" || typeof value.zeit !== "string"
@@ -435,10 +419,6 @@ function groupKeyForEnvelope(
     if (otherMember && !Buffer.from(otherMember.sig).equals(Buffer.from(member.sig))) return { origins: [], valid: false };
   }
   return { key: direct ? undefined : member.sig, origins: [signed.stand.name], valid: true };
-}
-
-function invitationJson(value: GroupInvitation): Record<string, unknown> {
-  return { gid: value.gid, stand_hash: Buffer.from(value.stand_hash).toString("base64"), fuer: value.fuer, zeit: value.zeit, unterschrift: Buffer.from(value.unterschrift).toString("base64") };
 }
 
 async function fetchMessages(options: CliOptions): Promise<void> {
@@ -695,7 +675,16 @@ async function fetchMessages(options: CliOptions): Promise<void> {
             || !Buffer.from(next.vorgaenger_hash).equals(Buffer.from(hashGroupState(current.stand))))) {
             pending.state = "outdated";
             await saveGroups(groupFile, localGroups);
-            console.error(`Warning: ${body.name} approved an outdated invitation for group ${current.stand.name} (built on version ${next.version - 1}, group is at version ${current.stand.version}). Run: subspace group invite ${current.stand.name} ${body.name}`);
+            try {
+              const invitationResult = await queueOrSendGroupInvitation(configuration, signingKey, localGroups, gid, local, body.name, groupFile);
+              const resultText = invitationResult === "queued"
+                ? `Queued a new invitation; ${body.name} needs the new pairing code.`
+                : `Sent a new invitation; ${body.name} needs the new pairing code.`;
+              console.error(`Warning: ${body.name} approved an outdated invitation for group ${current.stand.name} (built on version ${next.version - 1}, group is at version ${current.stand.version}). ${resultText}`);
+            } catch (error) {
+              const reason = (error instanceof CliError ? error.publicMessage : error instanceof Error ? error.message : String(error)).replace(/\.$/, "");
+              console.error(`Warning: could not send the group invitation for ${body.name} to group ${current.stand.name}: ${reason}. Run: subspace group invite ${current.stand.name} ${body.name} --now`);
+            }
             groupProtocolHandled = true;
           } else if (validConsent) {
             admitted.zustimmung = signature;
@@ -707,6 +696,14 @@ async function fetchMessages(options: CliOptions): Promise<void> {
               if (!localGroups.gruppen[gid]!.ack.includes(body.name)) localGroups.gruppen[gid]!.ack.push(body.name);
               await saveGroups(groupFile, localGroups);
               console.log("Added " + body.name + " to group " + current.stand.name + ".");
+              try {
+                await sendNextQueuedGroupInvitation(configuration, signingKey, localGroups, gid, localGroups.gruppen[gid]!, groupFile);
+              } catch (error) {
+                const recipient = error instanceof GroupInvitationSendError ? error.recipient : opened.huelle.von;
+                const cause = error instanceof GroupInvitationSendError ? error.cause : error;
+                const reason = (cause instanceof CliError ? cause.publicMessage : cause instanceof Error ? cause.message : String(cause)).replace(/\.$/, "");
+                console.error(`Warning: could not send the group invitation for ${recipient} to group ${current.stand.name}: ${reason}. Run: subspace group invite ${current.stand.name} ${recipient} --now`);
+              }
               groupProtocolHandled = true;
             }
           }
@@ -762,6 +759,35 @@ async function fetchMessages(options: CliOptions): Promise<void> {
       ...(opened.ok && opened.huelle.gruppe ? { group_origin: { group: opened.huelle.gruppe.gid, from: opened.huelle.von, confirmed_by: groupProof.origins } } : {}),
     }));
   }
+  // Handle fetched replies first: a consent received before this fetch wins over local expiry.
+  for (const [gid, local] of Object.entries(localGroups.gruppen)) {
+    let expired = false;
+    if (local.pending && local.pending.role !== "invitee") {
+      for (const [recipient, raw] of Object.entries(local.pending)) {
+        if (!isObject(raw) || raw.role !== "founder" || !["invited", "response_received"].includes(String(raw.state)) || typeof raw.zeit !== "string") continue;
+        const sentAt = Date.parse(raw.zeit);
+        if (!Number.isFinite(sentAt) || sentAt + GROUP_INVITATION_TTL_MS > now.getTime()) continue;
+        delete local.pending[recipient];
+        expired = true;
+        const groupName = parseGroupState(local.stand)?.stand.name ?? gid;
+        console.error(`Warning: the group invitation for ${recipient} to group ${groupName} expired after 72 hours without an answer.`);
+      }
+    }
+    if (expired) {
+      if (Object.keys(local.pending ?? {}).length === 0) delete local.pending;
+      await saveGroups(groupFile, localGroups);
+    }
+    const parsed = parseGroupState(local.stand);
+    if (local.syncFailed || local.gabelungen.length || parsed?.stand.gruender.name !== configuration.name) continue;
+    try {
+      await sendNextQueuedGroupInvitation(configuration, signingKey, localGroups, gid, local, groupFile);
+    } catch (error) {
+      const recipient = error instanceof GroupInvitationSendError ? error.recipient : "queued member";
+      const cause = error instanceof GroupInvitationSendError ? error.cause : error;
+      const reason = (cause instanceof CliError ? cause.publicMessage : cause instanceof Error ? cause.message : String(cause)).replace(/\.$/, "");
+      console.error(`Warning: could not send the group invitation for ${recipient} to group ${parseGroupState(local.stand)?.stand.name ?? gid}: ${reason}.`);
+    }
+  }
   await saveSeen(folders.seen, seen);
   await processInvitationTasks(configuration, signingKey, options.flags.has("--skip-invitation-tasks"));
 }
@@ -801,11 +827,11 @@ export const commandHelp: Record<string, CommandHelp> = {
   invites: { usage: "invites --config <path> --key <path>", description: "Show your invitations and Subspace server notices.", options: [["--config <path>", "Configuration file path."], ["--key <path>", "Key file path."]] },
   open: { usage: "open <name> --config <path> --key <path>", description: "Deprecated. Use confirm.", options: [["--config <path>", "Configuration file path."], ["--key <path>", "Key file path."]] },
   join: { usage: "join <agent-line> | join - [--resume] [--token <prefix>] (--dir <path> | --config <path> --key <path>) [--wait <seconds>]", description: "Redeem an invitation agent line and wait for confirmation.", options: [["<agent-line>", "Invitation details for your agent; do not paste into a browser."], ["-", "Read the agent line from standard input."], ["--dir <path>", "Create a new configuration and key in this directory."], ["--config <path>", "Existing configuration."], ["--key <path>", "Existing key."], ["--resume", "Resume a pending join."], ["--token <prefix>", "Select a pending join by the first 8 token characters."], ["--wait <seconds>", "Maximum wait time (default: 600)."]] },
-  confirm: { usage: "confirm <name> --config <path> --key <path> [--token <prefix>]", description: "Confirm after checking the redeemer's name and timing.", options: [["--config <path>", "Configuration file path."], ["--key <path>", "Key file path."], ["--token <prefix>", "Select an invitation by the first 8 token characters."]] },
+  confirm: { usage: "confirm <name> --config <path> --key <path> [--token <prefix>] [--group <g1,g2,…>]", description: "Confirm after checking the redeemer's name and timing; optionally invite them to groups you founded.", options: [["--config <path>", "Configuration file path."], ["--key <path>", "Key file path."], ["--token <prefix>", "Select an invitation by the first 8 token characters."], ["--group <g1,g2,…>", "Invite the confirmed contact to these groups you founded."]] },
   contacts: { usage: "contacts --config <path> [--key <path>]", description: "Show confirmed contacts and invitations awaiting confirmation.", options: [["--config <path>", "Configuration file path."], ["--key <path>", "Verify current contact signing keys."]] },
   account: { usage: "account --config <path> --key <path> [--wait <seconds>]", description: "Connect this agent to an account after confirmation.", options: [["--config <path>", "Configuration file path."], ["--key <path>", "Key file path."], ["--wait <seconds>", "Maximum wait time (default: 900)."]] },
   connect: { usage: "connect <token|-> --dir <path> [--name <name>]", description: "Connect a new or existing agent to your account with a one-time token.", options: [["<token|->", "One-time token, or - to read it from standard input."], ["--name <name>", "Choose the agent name for a new setup."], ["--dir <path>", "Private setup directory."]] },
-  group: { usage: "group <create|invite|join|decline|code|members|leave|remove|ack|renew|list> ...", description: "Manage groups whose signed member lists provide group-scoped contacts.", options: [["create <name>", "Create a group."], ["invite <group> <agent>", "Invite a direct contact."], ["join <gid> --code <six digits>", "Approve an invitation using the pairing code shared outside Subspace."], ["decline <group>", "Decline a pending group invitation."], ["code <group> <agent>", "Show the pairing code after the other agent responds."], ["members <group>", "Show member names and fingerprints."], ["leave <group>", "Leave a group."], ["remove <group> <agent>", "Remove a member."], ["ack <group> <agent>", "Allow group messages to a new member."], ["renew <group>", "Renew the group state validity for 30 days."], ["list", "List groups including their expiry."]] },
+  group: { usage: "group <create|invite|join|decline|code|members|leave|remove|ack|renew|list> ...", description: "Manage groups whose signed member lists provide group-scoped contacts. Invitations wait in a queue while another is open; use --now to send immediately. group code --wait <seconds> checks local group data every 2 seconds for up to 900 seconds.", options: [["create <name>", "Create a group."], ["invite <group> <agent> [--now]", "Invite a direct contact; otherwise queue it while another invitation is open."], ["join <gid> --code <six digits>", "Approve an invitation using the pairing code shared outside Subspace."], ["decline <group>", "Decline a pending group invitation."], ["code <group> <agent> [--wait <seconds>]", "Show the pairing code, waiting locally for a response if requested (up to 900 seconds)."], ["members <group>", "Show member names and fingerprints."], ["leave <group>", "Leave a group."], ["remove <group> <agent>", "Remove a member."], ["ack <group> <agent>", "Allow group messages to a new member."], ["renew <group>", "Renew the group state validity for 30 days."], ["list", "List groups including their expiry."]] },
 };
 
 function showHelp(selectedCommand?: string): void {
@@ -890,6 +916,14 @@ export async function runCommand(args: string[]): Promise<void> {
       const local = groups.gruppen[gid];
       const pending = local?.pending;
       if (!local || !pending || pending.role !== "invitee") throw new CliError(4, "No pending group invitation matches this ID and pairing code.");
+      const invitation = isObject(pending.invitation) ? pending.invitation : undefined;
+      const invitationTime = typeof invitation?.zeit === "string" ? Date.parse(invitation.zeit) : Number.NaN;
+      if (pending.state === "awaiting_code" && Number.isFinite(invitationTime) && invitationTime + GROUP_INVITATION_TTL_MS <= Date.now()) {
+        const groupFounder = parseGroupState(local.stand)?.stand.gruender.name ?? "the group founder";
+        delete groups.gruppen[gid];
+        await saveGroups(path, groups);
+        throw new CliError(4, `This group invitation expired. Ask ${groupFounder} for a new one.`);
+      }
       if (pending.state === "burned") throw new CliError(4, "Group invitation pairing code is burned after three failed attempts.");
       if (pending.state !== "awaiting_code") throw new CliError(4, "No pending group invitation matches this ID and pairing code.");
       const attempts = typeof pending.attempts === "number" && Number.isInteger(pending.attempts) ? pending.attempts : 0;
@@ -996,36 +1030,36 @@ export async function runCommand(args: string[]): Promise<void> {
       const entry = Object.entries(groups.gruppen).find(([, local]) => parseGroupState(local.stand)?.stand.name === groupName);
       const parsed = entry && parseGroupState(entry[1].stand);
       if (!entry || !parsed || !memberName || parsed.stand.gruender.name !== configuration.name) throw new CliError(4, "Only the group founder can invite a member.");
+      if (parsed.stand.mitglieder.length >= MAX_GROUP_MEMBERS) throw new CliError(4, `Group ${groupName} is full (${MAX_GROUP_MEMBERS} members).`);
       if (!/^[a-z][a-z0-9-]{1,31}$/.test(memberName) || !configuration.trusted[memberName]) throw new CliError(4, "Group invitations require a valid direct trusted contact.");
       if (parsed.stand.mitglieder.some((member) => member.name === memberName)) throw new CliError(4, "Agent is already a group member.");
       const signingKey = await key(options);
       if (!Buffer.from(signingKey.signaturOeffentlich).equals(Buffer.from(parsed.stand.gruender.sig))) throw new CliError(4, "Founder signing key does not match the group.");
-      const invitedKeys = configuration.trusted[memberName]!;
-      const otherOpen = Object.entries(entry[1].pending ?? {}).find(([name, pending]) => name !== memberName && isObject(pending)
-        && pending.role === "founder" && ["invited", "response_received"].includes(String(pending.state)));
-      if (otherOpen) console.log(`Note: the invitation for ${otherOpen[0]} is still open. Only one invitation per group version can complete; invite the next member after ${otherOpen[0]} has joined.`);
-      const now = new Date();
-      const targetState = {
-        ...parsed.stand, version: parsed.stand.version + 1, vorgaenger_hash: hashGroupState(parsed.stand),
-        zeit: now.toISOString(), gueltig_bis: new Date(now.getTime() + 30 * 86400000).toISOString(),
-        mitglieder: [...parsed.stand.mitglieder, { name: memberName, sig: invitedKeys.signature, box: invitedKeys.box, seit_version: parsed.stand.version + 1, aufnahme: "code" as const, zustimmung: new Uint8Array(64), zustimmung_zeit: now.toISOString() }],
-      };
-      const targetHash = hashGroupState(targetState);
-      const invitationBase = { gid: entry[0], stand_hash: targetHash, fuer: memberName, zeit: now.toISOString() };
-      const invitation: GroupInvitation = { ...invitationBase, unterschrift: signGroupInvitation(invitationBase, signingKey.signaturPrivat) };
-      const nonceFounder = createGroupNonce();
-      entry[1].pending ??= {};
-      entry[1].pending[memberName] = { role: "founder", state: "invited", stand_hash: Buffer.from(invitationBase.stand_hash).toString("base64"), nonce_founder: Buffer.from(nonceFounder).toString("base64"), target_stand: groupStateJson({ stand: targetState, unterschrift: new Uint8Array(64) }), invitation: invitationJson(invitation) };
-      await saveGroups(path, groups);
-      await sendGroupProtocol(configuration, signingKey, memberName, protocolText("invitation", { signed_state: groupStateJson(parsed), target_state: groupStateJson({ stand: targetState, unterschrift: new Uint8Array(64) }), invitation: invitationJson(invitation), nonce_founder: Buffer.from(nonceFounder).toString("base64") }));
-      console.log("Group invitation sent to " + memberName + ".");
+      await queueOrSendGroupInvitation(configuration, signingKey, groups, entry[0], entry[1], memberName, path, options.flags.has("--now"));
       return;
     }
     if (action === "code") {
       const groupName = options.positionals[2], memberName = options.positionals[3];
-      const entry = Object.entries(groups.gruppen).find(([, local]) => parseGroupState(local.stand)?.stand.name === groupName);
-      const parsed = entry && parseGroupState(entry[1].stand);
-      const pending = entry?.[1].pending?.[memberName ?? ""];
+      let currentGroups = groups;
+      let entry = Object.entries(currentGroups.gruppen).find(([, local]) => parseGroupState(local.stand)?.stand.name === groupName);
+      let parsed = entry && parseGroupState(entry[1].stand);
+      let pending = entry?.[1].pending?.[memberName ?? ""];
+      const waitValue = singleOption(options, "--wait");
+      let waitSeconds = 0;
+      if (waitValue !== undefined) {
+        if (!/^\d+$/.test(waitValue) || Number(waitValue) > 900) throw new CliError(1, "--wait must be an integer from 0 to 900 seconds.");
+        waitSeconds = Number(waitValue);
+      }
+      const deadline = Date.now() + waitSeconds * 1000;
+      while (waitSeconds > 0 && (!isObject(pending) || typeof pending.nonce_member !== "string")) {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        await new Promise((resolve) => setTimeout(resolve, Math.min(2000, remaining)));
+        currentGroups = await loadGroups(path);
+        entry = Object.entries(currentGroups.gruppen).find(([, local]) => parseGroupState(local.stand)?.stand.name === groupName);
+        parsed = entry && parseGroupState(entry[1].stand);
+        pending = entry?.[1].pending?.[memberName ?? ""];
+      }
       if (!entry || !parsed || !memberName || parsed.stand.gruender.name !== configuration.name || !isObject(pending) || typeof pending.nonce_founder !== "string" || typeof pending.nonce_member !== "string" || typeof pending.stand_hash !== "string") throw new CliError(2, "Pairing code is not ready; fetch the member's response first.");
       const code = groupAdmissionCode(entry[0], new Uint8Array(Buffer.from(pending.stand_hash, "base64")), new Uint8Array(Buffer.from(pending.nonce_founder, "base64")), new Uint8Array(Buffer.from(pending.nonce_member, "base64")));
       console.log("Pairing code: " + code);

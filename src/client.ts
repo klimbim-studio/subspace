@@ -49,7 +49,7 @@ async function request(
   try {
     return await retryOnRateLimit(() => {
       const headers = signRequest({ method: method, url, body: body, name, privateKey: privateKey, now: opt.now, nonce: opt.nonce });
-      return fetch(url, { method, headers, body: body.length ? Buffer.from(body) : undefined });
+      return fetch(url, { method, headers, body: body.length ? Buffer.from(body) : undefined, redirect: "error", signal: AbortSignal.timeout(30_000) });
     });
   } catch (error) {
     if (error instanceof CliError) throw error;

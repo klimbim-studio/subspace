@@ -18,12 +18,14 @@ import {
 } from "../join.ts";
 import { signRequest } from "../request.ts";
 import { fingerprint, type KeyPair } from "../seal.ts";
+import { MAX_GROUP_MEMBERS } from "../group.ts";
 import { sshPublicKeyFingerprint } from "../ssh.ts";
 import { getRecipientKeyStatuses } from "./authorization.ts";
 import { atomicWrite, CliError, loadConfiguration, loadKey, resolveConfigPath, saveConfiguration, type Configuration } from "./shared.ts";
 import { setup } from "./setup.ts";
 import { retryOnRateLimit } from "./network.ts";
 import { groupsFilePath, loadGroups } from "./group.ts";
+import { queueOrSendGroupInvitation } from "./group-invitations.ts";
 import { parseGroupState } from "../group.ts";
 
 export interface JoinOptions {
@@ -1041,12 +1043,13 @@ async function completeJoin(options: JoinOptions): Promise<void> {
       || Buffer.compare(Buffer.from(bytes(local.box_J, 32)), Buffer.from(key.boxOeffentlich)) !== 0) {
       throw new CliError(3, "Join state belongs to a different key.");
     }
+    const waitSeconds = await readWaitSeconds(options);
     if (local.zustand === "eingeloest") {
       await verifyResumeAndRedeem(local, key, statePath(config, "joins", local.token), configPath, singleOption(options, "--key", true)!);
-      await waitForInvitationOpen(config, local, await readWaitSeconds(options), configPath, singleOption(options, "--key", true)!);
-      return;
+      const opened = await waitForInvitationOpen(config, local, waitSeconds, configPath, singleOption(options, "--key", true)!);
+      return waitForConfirmation(config, key, configPath, opened, waitSeconds);
     }
-    return waitForConfirmation(config, key, configPath, local, await readWaitSeconds(options));
+    return waitForConfirmation(config, key, configPath, local, waitSeconds);
   }
   return joinLink(options);
 }
@@ -1057,6 +1060,25 @@ async function confirm(options: JoinOptions): Promise<void> {
   const configPath = resolveConfigPath(singleOption(options, "--config"));
   const config = await loadConfiguration(configPath);
   const key = await loadKey(singleOption(options, "--key", true)!);
+  const groupOption = singleOption(options, "--group");
+  const groupsToInvite: { gid: string; name: string }[] = [];
+  let groupsPath: string | undefined;
+  if (groupOption !== undefined) {
+    const names = groupOption.split(",");
+    if (names.some((name) => !name)) throw new CliError(4, "--group must contain comma-separated group names.");
+    groupsPath = groupsFilePath(config.storage);
+    const groupsFile = await loadGroups(groupsPath);
+    for (const groupName of names) {
+      const entry = Object.entries(groupsFile.gruppen).find(([, local]) => parseGroupState(local.stand)?.stand.name === groupName);
+      const parsed = entry && parseGroupState(entry[1].stand);
+      if (!entry || !parsed) throw new CliError(4, `Group ${groupName} is not stored on this agent.`);
+      if (parsed.stand.gruender.name !== config.name || !Buffer.from(parsed.stand.gruender.sig).equals(Buffer.from(key.signaturOeffentlich))) {
+        throw new CliError(4, `Only the founder can invite to group ${groupName}.`);
+      }
+      if (parsed.stand.mitglieder.length >= MAX_GROUP_MEMBERS) throw new CliError(4, `Group ${groupName} is full (${MAX_GROUP_MEMBERS} members).`);
+      groupsToInvite.push({ gid: entry[0], name: groupName });
+    }
+  }
   const prefix = singleOption(options, "--token");
   if (prefix !== undefined && !/^[A-Za-z0-9_-]{8}$/.test(prefix)) throw new CliError(1, "--token must contain the first 8 token characters.");
   await openInvitation(options);
@@ -1095,6 +1117,38 @@ async function confirm(options: JoinOptions): Promise<void> {
   const protocol = invitationTranscript(local);
   await assertTrustWritable(configPath, requestedName, protocol.sig_J, protocol.box_J);
 
+  const inviteGroupsAfterConfirmation = async (): Promise<void> => {
+    if (!groupsPath || !groupsToInvite.length) return;
+    const freshGroups = await loadGroups(groupsPath);
+    const updatedConfig = await loadConfiguration(configPath);
+    let failed = false;
+    for (const requested of groupsToInvite) {
+      const local = freshGroups.gruppen[requested.gid];
+      const parsed = local && parseGroupState(local.stand);
+      const groupName = parsed?.stand.name ?? requested.name;
+      let reason: string | undefined;
+      if (!local || !parsed) reason = `Group ${requested.name} is no longer stored on this agent.`;
+      else if (parsed.stand.gruender.name !== config.name || !Buffer.from(parsed.stand.gruender.sig).equals(Buffer.from(key.signaturOeffentlich))) {
+        reason = `Only the founder can invite to group ${groupName}.`;
+      } else if (parsed.stand.mitglieder.length >= MAX_GROUP_MEMBERS) {
+        reason = `Group ${groupName} is full (${MAX_GROUP_MEMBERS} members).`;
+      }
+      if (reason) {
+        failed = true;
+        console.error(`Warning: could not invite ${requestedName} to group ${groupName}: ${reason.replace(/\.$/, "")}. Run: subspace group invite ${groupName} ${requestedName}`);
+        continue;
+      }
+      try {
+        await queueOrSendGroupInvitation(updatedConfig, key, freshGroups, requested.gid, local!, requestedName, groupsPath);
+      } catch (error) {
+        failed = true;
+        const cause = (error instanceof CliError ? error.publicMessage : error instanceof Error ? error.message : String(error)).replace(/\.$/, "");
+        console.error(`Warning: could not invite ${requestedName} to group ${groupName}: ${cause}. Run: subspace group invite ${groupName} ${requestedName}`);
+      }
+    }
+    if (failed) throw new CliError(4, "One or more group invitations could not be sent.");
+  };
+
   const pinAndComplete = async (signature: Uint8Array): Promise<void> => {
     if (!ed25519.verify(signature, confirmationMessage(protocol), protocol.sig_I)) {
       throw new CliError(3, "Invalid confirmation for this join.");
@@ -1102,6 +1156,7 @@ async function confirm(options: JoinOptions): Promise<void> {
     await trust(configPath, requestedName, protocol.sig_J, protocol.box_J);
     await writeState(localFile, { ...local, zustand: "bestaetigt" });
     console.log("Join confirmed.");
+    await inviteGroupsAfterConfirmation();
   };
 
   const fetchConfirmation = async (expected?: Uint8Array): Promise<boolean> => {
@@ -1130,6 +1185,7 @@ async function confirm(options: JoinOptions): Promise<void> {
   await trust(configPath, requestedName, protocol.sig_J, protocol.box_J);
   await writeState(localFile, { ...local, zustand: "bestaetigt" });
   console.log("Join confirmed.");
+  await inviteGroupsAfterConfirmation();
 }
 
 async function listContacts(options: JoinOptions): Promise<void> {
